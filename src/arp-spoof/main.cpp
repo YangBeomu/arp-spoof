@@ -24,6 +24,7 @@ using namespace std;
 
 #define TICK_TIME           50000
 #define MAX_MTU             1500
+#define MAX_MSS             1460
 #define UDP_HEADER_SIZE     8
 
 struct Flow {
@@ -59,6 +60,7 @@ bool SendPacket(pcap_t* pcap, uint8_t* data,const int size);
 Packet ReadPacket(pcap_t* pcap);
 bool FindPacket(Packet packet, const uint16_t etherType, const Ip ip, const IpHdr::PROTOCOL_ID_TYPE type, const uint16_t port);
 void JumboPacketProcessing(pcap_t* pcap, const Packet& jPacket);
+void JumboFrameTcpProcessing(pcap_t* pcap, const Packet& jPacket);
 //bool Infect(pcap_t* pcap, const Mac& attackerMac, const Flow& flow, const Mac& targetMac);
 bool Infect(pcap_t* pcap, const Mac& attackerMac, const Mac& targetMac, const Ip& senderIP, const Ip& targetIP);
 
@@ -120,12 +122,12 @@ int main(int argc, char* argv[])
                     etherHeader->smac_ = attackMac;
                     etherHeader->dmac_ = arpTable[f.tip_];
 
-                    if(ipHeader->totalLen() > MAX_MTU)
+                    //udp, icmp ... -> auto ip fragment ex) caplen : 4000, ip header : 1500
+                    if(rPacket.header->caplen > MAX_MTU)
                         JumboPacketProcessing(pcap, rPacket);
-                        //SendPacket(pcap, rPacket.buf, rPacket.header->caplen);
+                        //JumboFrameTcpProcessing(pcap, rPacket);
                     else
                         SendPacket(pcap, rPacket.buf, rPacket.header->caplen);
-
 
                     break;
                 }
@@ -135,13 +137,12 @@ int main(int argc, char* argv[])
                     etherHeader->smac_ = attackMac;
                     etherHeader->dmac_ = arpTable[f.tip_];
 
-
-                    if(ipHeader->totalLen() > MAX_MTU)
+                    //udp, icmp ... -> auto ip fragment ex) caplen : 4000, ip header : 1500
+                    if(rPacket.header->caplen > MAX_MTU)
                         JumboPacketProcessing(pcap, rPacket);
-                        //SendPacket(pcap, rPacket.buf, rPacket.header->caplen);
+                        //JumboFrameTcpProcessing(pcap, rPacket);
                     else
                         SendPacket(pcap, rPacket.buf, rPacket.header->caplen);
-
 
                     break;
                 }
@@ -354,56 +355,209 @@ bool FindPacket(Packet packet, const uint16_t etherType, const Ip ip, const IpHd
     return false;
 }
 
+uint16_t CalculateIpChecksum(const void* vdata, size_t length) {
+    const uint8_t* data = (const uint8_t*)vdata;
+    uint32_t acc = 0;
+
+    for (size_t i = 0; i + 1 < length; i += 2) {
+        uint16_t word;
+        memcpy(&word, data + i, 2);
+        acc += ntohs(word);
+    }
+
+    if (length & 1) {
+        uint16_t word = 0;
+        memcpy(&word, data + length - 1, 1);
+        acc += ntohs(word);
+    }
+
+    while (acc >> 16)
+        acc = (acc & 0xFFFF) + (acc >> 16);
+
+    return htons(~acc);
+}
+
+struct PseudoHeader {
+    Ip srcAddr;
+    Ip dstAddr;
+    uint8_t reserved;
+    uint8_t protocol;
+    uint16_t tcpLen;
+};
+
+uint16_t CalculateTcpChecksum(IpHdr* ipHdr, TcpHdr* tcpHdr, const uint8_t* payload, uint16_t payloadLen) {
+    uint16_t tcpLen = tcpHdr->len() + payloadLen;
+    PseudoHeader pseudoHdr;
+
+    pseudoHdr.srcAddr = ipHdr->sip_;
+    pseudoHdr.dstAddr = ipHdr->dip_;
+    pseudoHdr.reserved = 0;
+    pseudoHdr.protocol = IPPROTO_TCP;
+    pseudoHdr.tcpLen = htons(tcpLen);
+
+    uint32_t acc = 0;
+
+    // Pseudo header
+    const uint16_t* pseudoPtr = (const uint16_t*)&pseudoHdr;
+    for (int i = 0; i < sizeof(PseudoHeader)/2; ++i) {
+        acc += ntohs(pseudoPtr[i]);
+    }
+
+    // TCP header + payload
+    const uint8_t* tcpData = (const uint8_t*)tcpHdr;
+    for (int i = 0; i + 1 < tcpLen; i += 2) {
+        uint16_t word;
+        memcpy(&word, tcpData + i, 2);
+        acc += ntohs(word);
+    }
+
+    if (tcpLen & 1) {
+        uint16_t word = 0;
+        memcpy(&word, tcpData + tcpLen - 1, 1);
+        acc += ntohs(word);
+    }
+
+    while (acc >> 16)
+        acc = (acc & 0xFFFF) + (acc >> 16);
+
+    return htons(~acc);
+}
+
+// void JumboPacketProcessing(pcap_t* pcap, const Packet& jPacket) {
+//     PEthHdr oriEtherHeader = reinterpret_cast<PEthHdr>(jPacket.buf);
+//     PIpHdr oriIpHeader = reinterpret_cast<PIpHdr>(jPacket.buf + sizeof(EthHdr));
+//     PTcpHdr oriTcpHeader = reinterpret_cast<PTcpHdr>(jPacket.buf + sizeof(EthHdr) + oriIpHeader->len());
+
+//     //udp or tcp
+//     const int headerLen = oriIpHeader->protocolId_ == IpHdr::UDP
+//                               ? oriIpHeader->len() + UDP_HEADER_SIZE
+//                               : oriIpHeader->len() + oriTcpHeader->len();
+//     const int maxFragmentPacketSize = MAX_MTU - oriIpHeader->len();
+//     int remainingPacketSize = jPacket.header->caplen - sizeof(EthHdr) - headerLen;
+
+//     int sendedPacketSize = 0;
+//     int fragmentPacketSize = 0;
+//     int fragmentOffset = 0;
+
+//     bool test = true;
+
+//     while(remainingPacketSize > 0) {
+//         fragmentPacketSize = maxFragmentPacketSize > remainingPacketSize
+//                                  ? remainingPacketSize : maxFragmentPacketSize;
+
+//         unique_ptr<uint8_t[]> fragmentPacketBuf(new uint8_t[fragmentPacketSize + sizeof(EthHdr) + headerLen]);
+//         //header
+//         if(test) {
+//             memcpy(fragmentPacketBuf.get(), jPacket.buf, sizeof(EthHdr) + headerLen);
+//         }else {
+//             memcpy(fragmentPacketBuf.get(), jPacket.buf, sizeof(EthHdr) + oriIpHeader->len());
+//         }
+//         //data
+//         if(test) {
+//             memcpy(fragmentPacketBuf.get() + sizeof(EthHdr) + headerLen, jPacket.buf + sizeof(EthHdr) + headerLen + sendedPacketSize, fragmentPacketSize);
+//             test = false;
+//         }else {
+//             memcpy(fragmentPacketBuf.get() + sizeof(EthHdr) + oriIpHeader->len(), jPacket.buf + sizeof(EthHdr) + headerLen + sendedPacketSize, fragmentPacketSize);
+//         }
+
+//         PIpHdr ipHeader = reinterpret_cast<PIpHdr>(fragmentPacketBuf.get() + sizeof(EthHdr));
+
+//         ipHeader->flags_fragOffset_ = remainingPacketSize > maxFragmentPacketSize
+//             ? htons(IpHdr::IP_FLAGS_TYPE::MF | fragmentOffset)
+//             : htons(IpHdr::IP_FLAGS_TYPE::RESORVED | fragmentOffset);
+
+//         ipHeader->totalPacketLen_ = htons(oriIpHeader->len() + fragmentPacketSize);
+
+//         remainingPacketSize -= fragmentPacketSize;
+//         sendedPacketSize += fragmentPacketSize;
+//         fragmentOffset += fragmentPacketSize / 8;
+
+//         SendPacket(pcap, reinterpret_cast<uint8_t*>(fragmentPacketBuf.get()), sizeof(EthHdr) + oriIpHeader->len() + fragmentPacketSize);
+//     }
+// }
+
 void JumboPacketProcessing(pcap_t* pcap, const Packet& jPacket) {
     PEthHdr oriEtherHeader = reinterpret_cast<PEthHdr>(jPacket.buf);
     PIpHdr oriIpHeader = reinterpret_cast<PIpHdr>(jPacket.buf + sizeof(EthHdr));
-    PTcpHdr oriTcpHeader = reinterpret_cast<PTcpHdr>(jPacket.buf + sizeof(EthHdr) + oriIpHeader->len());
 
     //udp or tcp
-    const int headerLen = oriIpHeader->protocolId_ == IpHdr::UDP
-                              ? oriIpHeader->len() + UDP_HEADER_SIZE
-                              : oriIpHeader->len() + oriTcpHeader->len();
-    const int maxFragmentPacketSize = MAX_MTU - oriIpHeader->len();
-    int remainingPacketSize = jPacket.header->caplen - sizeof(EthHdr) - headerLen;
+    const int ipHeaderLen = oriIpHeader->len();
+    const int totalHeaderLen = sizeof(EthHdr) + ipHeaderLen;
+    const int maxFragmentPacketSize = MAX_MTU - ipHeaderLen;
+    int remainingPacketSize = jPacket.header->caplen - sizeof(EthHdr) - ipHeaderLen;
 
     int sendedPacketSize = 0;
     int fragmentPacketSize = 0;
     int fragmentOffset = 0;
 
-    bool test = true;
-
     while(remainingPacketSize > 0) {
         fragmentPacketSize = maxFragmentPacketSize > remainingPacketSize
                                  ? remainingPacketSize : maxFragmentPacketSize;
 
-        unique_ptr<uint8_t[]> fragmentPacketBuf(new uint8_t[fragmentPacketSize + sizeof(EthHdr) + headerLen]);
+        unique_ptr<uint8_t[]> fragmentPacketBuf(new uint8_t[fragmentPacketSize + totalHeaderLen]);
         //header
-        if(test) {
-            memcpy(fragmentPacketBuf.get(), jPacket.buf, sizeof(EthHdr) + headerLen);
-        }else {
-            memcpy(fragmentPacketBuf.get(), jPacket.buf, sizeof(EthHdr) + oriIpHeader->len());
-        }
+        memcpy(fragmentPacketBuf.get(), jPacket.buf, totalHeaderLen);
+
         //data
-        if(test) {
-            memcpy(fragmentPacketBuf.get() + sizeof(EthHdr) + headerLen, jPacket.buf + sizeof(EthHdr) + headerLen + sendedPacketSize, fragmentPacketSize);
-            test = false;
-        }else {
-            memcpy(fragmentPacketBuf.get() + sizeof(EthHdr) + oriIpHeader->len(), jPacket.buf + sizeof(EthHdr) + headerLen + sendedPacketSize, fragmentPacketSize);
-        }
+        memcpy(fragmentPacketBuf.get() + totalHeaderLen, jPacket.buf + totalHeaderLen + sendedPacketSize, fragmentPacketSize);
 
         PIpHdr ipHeader = reinterpret_cast<PIpHdr>(fragmentPacketBuf.get() + sizeof(EthHdr));
 
         ipHeader->flags_fragOffset_ = remainingPacketSize > maxFragmentPacketSize
-            ? htons(IpHdr::IP_FLAGS_TYPE::MF | fragmentOffset)
-            : htons(IpHdr::IP_FLAGS_TYPE::RESORVED | fragmentOffset);
+                                          ? htons(IpHdr::IP_FLAGS_TYPE::MF | fragmentOffset)
+                                          : htons(IpHdr::IP_FLAGS_TYPE::RESORVED | fragmentOffset);
 
-        ipHeader->totalPacketLen_ = htons(oriIpHeader->len() + fragmentPacketSize);
+        ipHeader->totalPacketLen_ = htons(ipHeaderLen + fragmentPacketSize);
+        ipHeader->headerChecksum_ = 0;
+        ipHeader->headerChecksum_ = CalculateIpChecksum(ipHeader, ipHeader->len());
 
         remainingPacketSize -= fragmentPacketSize;
         sendedPacketSize += fragmentPacketSize;
         fragmentOffset += fragmentPacketSize / 8;
 
-        SendPacket(pcap, reinterpret_cast<uint8_t*>(fragmentPacketBuf.get()), sizeof(EthHdr) + oriIpHeader->len() + fragmentPacketSize);
+        SendPacket(pcap, reinterpret_cast<uint8_t*>(fragmentPacketBuf.get()), totalHeaderLen + fragmentPacketSize);
+    }
+}
+
+void JumboFrameTcpProcessing(pcap_t* pcap, const Packet& jPacket) {
+    PEthHdr oriEtherHeader = reinterpret_cast<PEthHdr>(jPacket.buf);
+    PIpHdr oriIpHeader = reinterpret_cast<PIpHdr>(jPacket.buf + sizeof(EthHdr));
+    PTcpHdr oriTcpHeader = reinterpret_cast<PTcpHdr>(jPacket.buf + sizeof(EthHdr) + oriIpHeader->len());
+
+    const uint32_t totalHeaderLen = sizeof(EthHdr) + oriIpHeader->len() + oriTcpHeader->len();
+    uint32_t tcpPayloadSize = oriIpHeader->totalLen() - oriIpHeader->len() - oriTcpHeader->len();
+
+    uint32_t sendBytes = 0, sendedBytes = 0;
+
+    while(tcpPayloadSize) {
+        sendBytes = tcpPayloadSize > MAX_MSS ? MAX_MSS : tcpPayloadSize;
+        unique_ptr<uint8_t> segmentPacket(new uint8_t[MAX_MSS + totalHeaderLen]);
+
+        //header
+        memcpy(segmentPacket.get(), jPacket.buf, totalHeaderLen);
+        //data
+        memcpy(segmentPacket.get() + totalHeaderLen, jPacket.buf + totalHeaderLen, sendBytes);
+
+
+
+        PIpHdr ipHeader = reinterpret_cast<PIpHdr>(segmentPacket.get() + sizeof(EthHdr));
+        ipHeader->totalPacketLen_ = htons(oriIpHeader->len() + oriTcpHeader->len() + sendBytes);
+        //id?
+        ipHeader->id_ += ntohs(sendedBytes);
+        //checksum?
+        ipHeader->headerChecksum_ = 0;
+        ipHeader->headerChecksum_ = CalculateIpChecksum(ipHeader, ipHeader->len());
+
+        PTcpHdr tcpHeader = reinterpret_cast<PTcpHdr>(segmentPacket.get() + sizeof(EthHdr) + ipHeader->len());
+        tcpHeader->seqNumber_ =  htonl(ntohl(oriTcpHeader->seqNumber_) + sendedBytes);
+        //checksum?
+        tcpHeader->checksum_ = 0;
+        tcpHeader->checksum_ = CalculateTcpChecksum(ipHeader, tcpHeader, (reinterpret_cast<uint8_t*>(tcpHeader) + tcpHeader->len()), sendBytes);
+
+        sendedBytes += sendBytes;
+        tcpPayloadSize -= sendBytes;
+
+        SendPacket(pcap, segmentPacket.get(), totalHeaderLen + sendBytes);
     }
 }
 

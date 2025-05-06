@@ -27,7 +27,7 @@ typedef struct IP_HEADER {
     uint8_t version_headerLen_;
     uint8_t TOS_;
     uint16_t totalPacketLen_;
-    uint16_t id;
+    uint16_t id_;
 
     uint16_t flags_fragOffset_;
 

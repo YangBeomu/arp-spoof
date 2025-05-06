@@ -151,7 +151,7 @@ void signalHandler(int signal) {
 
     auto& arpTable = *g_arpTablePtr;
     auto& flowList = *g_flowListPtr;
-    for(const auto& f : flowList) Recover(g_pcap, g_attackMac, arpTable[f.sip_], arpTable[f.tip_], f.sip_, f.tip_);
+    for(const auto& f : flowList) Recover(g_pcap, g_attackMac, arpTable[f.sip_], arpTable[f.tip_], f.sip_, f.tip_, ARP_HEDAER::Arp_Request);
 
     pcap_close(g_pcap);
 

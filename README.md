@@ -6,6 +6,7 @@
    
 ## Warning
   network settings : virtualbox - setting - network - bridge - Promiscuous Mode ( all accept )  
+  <br>
   Since packets from the host OS are also captured by the virtual OS, all incoming packets to the host IP need to be filtered.
   ```C++
   Ip g_hostIp(string("192.168.0.100"));
